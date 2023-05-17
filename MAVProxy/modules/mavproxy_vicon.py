@@ -45,15 +45,17 @@ class ViconModule(mp_module.MPModule):
              ('vel_filter_hz', float, 30.0),
              ('gps_rate', int, 5),
              ('gps_nsats', float, 16),
-             ('object_name', str, None)
+             # ('object_name', str, None)
              ])
         self.add_command('vicon', self.cmd_vicon, 'VICON control',
                          ["<start>",
                           "<stop>",
+                          "<add>",
                           "set (VICONSETTING)"])
         self.add_completion_function('(VICONSETTING)',
                                      self.vicon_settings.completion)
         self.vicon = None
+        self.vicon_objects = {}
         self.thread = threading.Thread(target=self.thread_loop)
         self.thread.start()
         self.pos = None
@@ -62,24 +64,31 @@ class ViconModule(mp_module.MPModule):
         self.gps_count = 0
         self.vision_count = 0
         self.last_frame_count = 0
-        self.vel_filter = LowPassFilter2p.LowPassFilter2p(200.0, 30.0)
+        # self.vel_filter = LowPassFilter2p.LowPassFilter2p(200.0, 30.0)
         self.actual_frame_rate = 0.0
 
     def detect_vicon_object(self):
         self.vicon.get_frame()
-        object_name = self.vicon_settings.object_name
-        if object_name is None:
+        if len(self.vicon_objects) == 0:
             # We haven't specified which object we are looking for, so just find the first one
             object_name = self.vicon.get_subject_name(0)
-        if object_name is None:
-            # No objects found
-            return None, None
-        segment_name = self.vicon.get_subject_root_segment_name(object_name)
-        if segment_name is None:
-            # Object we're looking for can't be found
-            return None, None
-        print("Connected to subject '%s' segment '%s'" % (object_name, segment_name))
-        return object_name, segment_name
+            if object_name is None:
+                # No objects found
+                return None
+            self.vicon_objects[object_name] = {'id': self.target_system}
+
+        for object_name in self.vicon_objects.keys():
+            segment_name = self.vicon.get_subject_root_segment_name(object_name)
+            if segment_name is None:
+                # Object we're looking for can't be found
+                print("Can't find object '%s'" % object_name)
+                print("Did you mean", self.vicon.get_subject_name(0))
+                return None
+            print("Connected to subject '%s' segment '%s'" % (object_name, segment_name))
+            self.vicon_objects[object_name]['segment'] = segment_name
+            self.vicon_objects[object_name]['vel_filter'] = LowPassFilter2p.LowPassFilter2p(200.0, 30.0)
+        print(self.vicon_objects)
+        return self.vicon_objects
 
     def get_vicon_pose(self, object_name, segment_name):
 
@@ -101,8 +110,7 @@ class ViconModule(mp_module.MPModule):
 
     def thread_loop(self):
         """background processing"""
-        object_name = None
-        segment_name = None
+        vicon_objects = None
         last_pos = None
         last_frame_num = None
         frame_count = 0
@@ -113,9 +121,9 @@ class ViconModule(mp_module.MPModule):
                 object_name = None
                 continue
 
-            if not object_name:
-                object_name, segment_name = self.detect_vicon_object()
-                if object_name is None:
+            if not vicon_objects:
+                vicon_objects = self.detect_vicon_object()
+                if vicon_objects is None:
                     continue
                 last_msg_time = time.time()
                 now = time.time()
@@ -126,7 +134,7 @@ class ViconModule(mp_module.MPModule):
                 frame_dt = 1.0/frame_rate
                 last_rate = time.time()
                 frame_count = 0
-                print("Vicon frame rate %.1f" % frame_rate)
+            # print("Vicon frame rate %.1f" % frame_rate)
 
             if self.vicon_settings.gps_rate > 0:
                 gps_period_ms = 1000 // self.vicon_settings.gps_rate
@@ -143,25 +151,37 @@ class ViconModule(mp_module.MPModule):
                 self.actual_frame_rate = 0.9 * self.actual_frame_rate + 0.1 * rate
                 last_rate = now
                 frame_count = 0
-                self.vel_filter.set_cutoff_frequency(self.actual_frame_rate, self.vicon_settings.vel_filter_hz)
+                for target in vicon_objects.values():
+                    target['vel_filter'].set_cutoff_frequency(self.actual_frame_rate, self.vicon_settings.vel_filter_hz)
 
-            pos_ned, roll, pitch, yaw = self.get_vicon_pose(object_name, segment_name)
-            if pos_ned is None:
+            failed = False
+            for object_name, target in vicon_objects.items():
+                pos_ned, roll, pitch, yaw = self.get_vicon_pose(object_name, target['segment'])
+                if pos_ned is None:
+                    failed = True
+                    break
+                target['pos_ned'] = pos_ned
+                target['roll'] = roll
+                target['pitch'] = pitch
+                target['yaw'] = yaw
+            if failed:
+                print("Get pose failed")
                 continue
-            
+
             # print(f"XYZ: {pos_ned.x}, {pos_ned.y}, {pos_ned.z}, ")
 
             if last_frame_num is None or frame_num - last_frame_num > 100 or frame_num <= last_frame_num:
                 last_frame_num = frame_num
-                last_pos = pos_ned
+                for target in vicon_objects.values():
+                    target['last_pos'] = target['pos_ned']
                 continue
 
             dt = (frame_num - last_frame_num) * frame_dt
-            vel = (pos_ned - last_pos) * (1.0/dt)
-            last_pos = pos_ned
+            for target in vicon_objects.values():
+                vel = (target['pos_ned'] - target['last_pos']) * (1.0/dt)
+                target['last_pos'] = target['pos_ned']
+                target['filtered_vel'] = target['vel_filter'].apply(vel)
             last_frame_num = frame_num
-
-            filtered_vel = self.vel_filter.apply(vel)
 
             if self.vicon_settings.vision_rate > 0:
                 dt = now - last_msg_time
@@ -170,8 +190,11 @@ class ViconModule(mp_module.MPModule):
 
             last_msg_time = now
 
-            self.pos = pos_ned
-            self.att = [math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
+            # self.pos = pos_ned
+            # self.att = [math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
+            for name, obj in vicon_objects.items():
+                self.vicon_objects[name]['pos'] = obj['pos_ned']
+                self.vicon_objects[name]['att'] = (math.degrees(obj['roll']), math.degrees(obj['pitch']), math.degrees(obj['yaw']))
             self.frame_count += 1
 
             time_us = int(now * 1.0e6)
@@ -180,17 +203,20 @@ class ViconModule(mp_module.MPModule):
                 # send a heartbeat msg
                 mav.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS, mavutil.mavlink.MAV_AUTOPILOT_GENERIC, 0, 0, 0)
 
-                # send origin at 1Hz
-                mav.mav.set_gps_global_origin_send(self.target_system,
-                                                   int(self.vicon_settings.origin_lat*1.0e7),
-                                                   int(self.vicon_settings.origin_lon*1.0e7),
-                                                   int(self.vicon_settings.origin_alt*1.0e3),
-                                                   time_us)
+                for target in vicon_objects.values():
+                    # send origin at 1Hz
+                    mav.mav.set_gps_global_origin_send(target['id'],
+                                                    int(self.vicon_settings.origin_lat*1.0e7),
+                                                    int(self.vicon_settings.origin_lon*1.0e7),
+                                                    int(self.vicon_settings.origin_alt*1.0e3),
+                                                    time_us)
                 last_origin_send = now
 
             if self.vicon_settings.gps_rate > 0 and now_ms - last_gps_send_ms > gps_period_ms:
                 '''send GPS data at the specified rate, trying to align on the given period'''
-                self.gps_input_send(now, pos_ned, yaw, filtered_vel)
+                for target in vicon_objects.values():
+                    self.master.mav.target_id = target['id']
+                    self.gps_input_send(now, target['pos_ned'], target['yaw'], target['filtered_vel'])
                 last_gps_send_ms = (now_ms//gps_period_ms) * gps_period_ms
                 self.gps_count += 1
 
@@ -198,9 +224,13 @@ class ViconModule(mp_module.MPModule):
                 # send VISION_POSITION_ESTIMATE
                 # we force mavlink1 to avoid the covariances which seem to make the packets too large
                 # for the mavesp8266 wifi bridge
-                mav.mav.global_vision_position_estimate_send(time_us,
-                                                             pos_ned.x, pos_ned.y, pos_ned.z,
-                                                             roll, pitch, yaw, force_mavlink1=True)
+                for target in vicon_objects.values():
+                    self.master.mav.target_id = target['id']
+                    # print("Sending data to quad", self.master.mav.target_id)
+                    # print(f"[{target['segment']}]: {target['pos_ned'].x},{target['pos_ned'].y},{target['pos_ned'].z}")
+                    mav.mav.global_vision_position_estimate_send(time_us,
+                                                                 target['pos_ned'].x, target['pos_ned'].y, target['pos_ned'].z,
+                                                                 target['roll'], target['pitch'], target['yaw'], force_mavlink1=True)
                 self.vision_count += 1
 
     def gps_input_send(self, time, pos_ned, yaw, gps_vel):
@@ -231,7 +261,10 @@ class ViconModule(mp_module.MPModule):
         """start vicon"""
         vicon = pyvicon.PyVicon()
         print("Opening Vicon connection to %s" % self.vicon_settings.host)
-        vicon.connect(self.vicon_settings.host)
+        r = vicon.connect(self.vicon_settings.host)
+        if r.value != 2:
+            print("Error connecting to vicon:", r)
+            return
         print("Configuring vicon")
         vicon.set_stream_mode(pyvicon.StreamMode.ClientPull)
         vicon.enable_marker_data()
@@ -250,24 +283,32 @@ class ViconModule(mp_module.MPModule):
         if len(args) == 0:
             print("Usage: vicon <set|start|stop>")
             return
-        if args[0] == "start":
+        elif args[0] == "start":
             self.cmd_start()
-        if args[0] == "stop":
+        elif args[0] == "stop":
             self.vicon = None
+        elif args[0] == "add":
+            if len(args) != 3:
+                print("Usage: vicon add <object_name> <target_id>")
+                return
+            self.vicon_objects[args[1]] = {'id': int(args[2])}
         elif args[0] == "set":
             self.vicon_settings.command(args[1:])
 
     def idle_task(self):
         """run on idle"""
-        if not self.pos or not self.att or self.frame_count == self.last_frame_count:
+        if self.frame_count == self.last_frame_count:
             return
         self.last_frame_count = self.frame_count
-        self.console.set_status('VPos', 'Vicon: Pos: %.2fN %.2fE %.2fD' % (self.pos.x, self.pos.y, self.pos.z), row=5)
-        self.console.set_status('VAtt', ' Att R:%.2f P:%.2f Y:%.2f GPS %u VIS %u RATE %.1f' % (self.att[0], self.att[1], self.att[2],
-                                                                                         self.gps_count, self.vision_count,
-                                                                                         self.actual_frame_rate), row=5)
-
-
+        # self.console.set_status('VPos', 'Vicon: Pos: %.2fN %.2fE %.2fD' % (self.pos.x, self.pos.y, self.pos.z), row=5)
+        # self.console.set_status('VAtt', ' Att R:%.2f P:%.2f Y:%.2f GPS %u VIS %u RATE %.1f' % (self.att[0], self.att[1], self.att[2],
+        #                                                                                  self.gps_count, self.vision_count,
+        #                                                                                  self.actual_frame_rate), row=5)
+        # for target in self.vicon_objects.values():
+        #     try:
+        #         print(f"[{target['segment']}]: {target['pos_ned'].x},{target['pos_ned'].y},{target['pos_ned'].z}\t\t{target['att']}")
+        #     except IndexError:
+        #         pass
 def init(mpstate):
     """initialise module"""
     return ViconModule(mpstate)
